@@ -26,6 +26,24 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate required secrets
+        env:
+          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+        run: |
+          missing=0
+          if [ -z "$FACEBOOK_PAGE_ID" ]; then
+            echo "::error::Missing secret: FACEBOOK_PAGE_ID"
+            missing=1
+          fi
+          if [ -z "$FACEBOOK_PAGE_ACCESS_TOKEN" ]; then
+            echo "::error::Missing secret: FACEBOOK_PAGE_ACCESS_TOKEN"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
       - name: Restore posting state cache
         uses: actions/cache/restore@v4
         with:
