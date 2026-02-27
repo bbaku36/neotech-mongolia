@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -96,6 +97,32 @@ def clean_html_text(value: str) -> str:
     return re.sub(r"\s+", " ", unescaped).strip()
 
 
+def urlopen_with_retry(
+    req: urllib.request.Request,
+    timeout_sec: int,
+    label: str,
+):
+    retries = max(1, int(os.getenv("HTTP_RETRIES", "3")))
+    backoff_sec = max(1, int(os.getenv("HTTP_RETRY_BACKOFF_SEC", "2")))
+    last_exc: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout_sec)
+        except Exception as exc:
+            last_exc = exc
+            reason = exc
+            if isinstance(exc, urllib.error.URLError):
+                reason = exc.reason
+            print(f"[WARN] {label} failed ({attempt}/{retries}): {reason}")
+            if attempt < retries:
+                time.sleep(backoff_sec * attempt)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{label} failed with unknown error")
+
+
 def translate_to_mongolian(text: str, timeout_sec: int = 15) -> str:
     """Translate text to Mongolian using a lightweight public endpoint."""
     if not text.strip():
@@ -119,7 +146,7 @@ def translate_to_mongolian(text: str, timeout_sec: int = 15) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+        with urlopen_with_retry(req, timeout_sec, "translate.googleapis.com request") as response:
             body = response.read().decode("utf-8")
         payload = json.loads(body)
         parts = payload[0] if isinstance(payload, list) and payload else []
@@ -198,7 +225,7 @@ def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> Li
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+        with urlopen_with_retry(req, timeout_sec, "OpenAI headline rewrite request") as response:
             raw = response.read().decode("utf-8")
         data = json.loads(raw)
         content = (
@@ -264,7 +291,7 @@ def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+        with urlopen_with_retry(req, timeout_sec, "OpenAI brief rewrite request") as response:
             raw = response.read().decode("utf-8")
         data = json.loads(raw)
         content = (
@@ -293,7 +320,7 @@ def resolve_final_url(url: str, timeout_sec: int = 12) -> str:
         headers={"User-Agent": "Mozilla/5.0 (compatible; FBMongoliaAutoPost/1.0)"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+        with urlopen_with_retry(req, timeout_sec, f"Resolve final URL: {url}") as response:
             final_url = (response.geturl() or "").strip()
             return final_url or url
     except Exception:
@@ -360,7 +387,7 @@ def fetch_rss_items(url: str, timeout_sec: int = 20) -> List[Dict[str, Any]]:
         },
     )
 
-    with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+    with urlopen_with_retry(req, timeout_sec, f"Fetch feed: {url}") as response:
         content = response.read()
 
     root = ET.fromstring(content)
@@ -623,7 +650,7 @@ def post_to_facebook(page_id: str, page_access_token: str, message: str) -> Dict
     ).encode("utf-8")
 
     req = urllib.request.Request(url, data=payload, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urlopen_with_retry(req, 30, "Facebook post request") as response:
         body = response.read().decode("utf-8")
 
     return json.loads(body)
