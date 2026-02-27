@@ -188,24 +188,33 @@ def try_parse_json_array(text: str) -> List[str] | None:
     return None
 
 
-def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> List[str] | None:
+def resolve_ai_provider() -> str:
+    provider = os.getenv("AI_PROVIDER", "auto").strip().lower()
+    if provider in {"openai", "gemini"}:
+        return provider
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        return "gemini"
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        return "openai"
+    return "none"
+
+
+def rewrite_json_array_with_openai(
+    system_prompt: str,
+    user_prompt: str,
+    expected_len: int,
+    timeout_sec: int,
+    label: str,
+) -> List[str] | None:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key or not headlines:
+    if not api_key:
         return None
 
     model = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
     url = f"{base_url}/chat/completions"
 
-    system_prompt = (
-        "You are a Mongolian tech news editor. Rewrite each input headline into natural,"
-        " concise Mongolian suitable for Facebook news posts. Keep names of people,"
-        " companies, and products accurate. Do not add facts. Return only a JSON array"
-        " of strings in the same order and same length as input."
-    )
-    user_prompt = "Headlines:\n" + "\n".join(f"{i + 1}. {h}" for i, h in enumerate(headlines))
-
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -215,6 +224,7 @@ def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> Li
     # gpt-5* chat-completions currently accepts only default temperature.
     if not model.lower().startswith("gpt-5"):
         payload["temperature"] = 0.2
+
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -227,7 +237,7 @@ def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> Li
     )
 
     try:
-        with urlopen_with_retry(req, timeout_sec, "OpenAI headline rewrite request") as response:
+        with urlopen_with_retry(req, timeout_sec, f"OpenAI {label} request") as response:
             raw = response.read().decode("utf-8")
         data = json.loads(raw)
         content = (
@@ -237,22 +247,122 @@ def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> Li
             .strip()
         )
         parsed = try_parse_json_array(content)
-        if parsed and len(parsed) == len(headlines):
-            return [x.strip() or headlines[i] for i, x in enumerate(parsed)]
+        if parsed and len(parsed) == expected_len:
+            return [x.strip() for x in parsed]
     except Exception:
         return None
 
     return None
 
 
-def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -> List[str] | None:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key or not items:
+def rewrite_json_array_with_gemini(
+    system_prompt: str,
+    user_prompt: str,
+    expected_len: int,
+    timeout_sec: int,
+    label: str,
+) -> List[str] | None:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
         return None
 
-    model = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
-    url = f"{base_url}/chat/completions"
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+    query = urllib.parse.urlencode({"key": api_key})
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?{query}"
+
+    prompt = (
+        f"{system_prompt}\n\n{user_prompt}\n\n"
+        f"Return ONLY a JSON array of strings with exactly {expected_len} items."
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urlopen_with_retry(req, timeout_sec, f"Gemini {label} request") as response:
+            raw = response.read().decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict) and "error" in data:
+            return None
+        parts = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+        content = "".join(
+            str(p.get("text", "")) for p in parts if isinstance(p, dict)
+        ).strip()
+        parsed = try_parse_json_array(content)
+        if parsed and len(parsed) == expected_len:
+            return [x.strip() for x in parsed]
+    except Exception:
+        return None
+
+    return None
+
+
+def rewrite_json_array_with_ai(
+    system_prompt: str,
+    user_prompt: str,
+    expected_len: int,
+    timeout_sec: int,
+    label: str,
+) -> List[str] | None:
+    provider = resolve_ai_provider()
+
+    if provider == "gemini":
+        out = rewrite_json_array_with_gemini(system_prompt, user_prompt, expected_len, timeout_sec, label)
+        if out is not None:
+            return out
+        return rewrite_json_array_with_openai(system_prompt, user_prompt, expected_len, timeout_sec, label)
+
+    if provider == "openai":
+        out = rewrite_json_array_with_openai(system_prompt, user_prompt, expected_len, timeout_sec, label)
+        if out is not None:
+            return out
+        return rewrite_json_array_with_gemini(system_prompt, user_prompt, expected_len, timeout_sec, label)
+
+    return None
+
+
+def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> List[str] | None:
+    if not headlines:
+        return None
+
+    system_prompt = (
+        "You are a Mongolian tech news editor. Rewrite each input headline into natural,"
+        " concise Mongolian suitable for Facebook news posts. Keep names of people,"
+        " companies, and products accurate. Do not add facts. Return only a JSON array"
+        " of strings in the same order and same length as input."
+    )
+    user_prompt = "Headlines:\n" + "\n".join(f"{i + 1}. {h}" for i, h in enumerate(headlines))
+
+    parsed = rewrite_json_array_with_ai(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        expected_len=len(headlines),
+        timeout_sec=timeout_sec,
+        label="headline rewrite",
+    )
+    if parsed and len(parsed) == len(headlines):
+        return [x or headlines[i] for i, x in enumerate(parsed)]
+    return None
+
+
+def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -> List[str] | None:
+    if not items:
+        return None
 
     compact_items: List[Dict[str, str]] = []
     for item in items:
@@ -273,44 +383,13 @@ def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -
     )
     user_prompt = "Items JSON:\n" + json.dumps(compact_items, ensure_ascii=False)
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    # gpt-5* chat-completions currently accepts only default temperature.
-    if not model.lower().startswith("gpt-5"):
-        payload["temperature"] = 0.2
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+    return rewrite_json_array_with_ai(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        expected_len=len(items),
+        timeout_sec=timeout_sec,
+        label="brief rewrite",
     )
-
-    try:
-        with urlopen_with_retry(req, timeout_sec, "OpenAI brief rewrite request") as response:
-            raw = response.read().decode("utf-8")
-        data = json.loads(raw)
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-        )
-        parsed = try_parse_json_array(content)
-        if parsed and len(parsed) == len(items):
-            return [x.strip() for x in parsed]
-    except Exception:
-        return None
-
-    return None
 
 
 def build_mongolian_reader_link(url: str) -> str:
