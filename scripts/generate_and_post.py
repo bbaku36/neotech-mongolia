@@ -207,12 +207,14 @@ def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> Li
 
     payload = {
         "model": model,
-        "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
+    # gpt-5* chat-completions currently accepts only default temperature.
+    if not model.lower().startswith("gpt-5"):
+        payload["temperature"] = 0.2
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -273,12 +275,14 @@ def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -
 
     payload = {
         "model": model,
-        "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
+    # gpt-5* chat-completions currently accepts only default temperature.
+    if not model.lower().startswith("gpt-5"):
+        payload["temperature"] = 0.2
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
