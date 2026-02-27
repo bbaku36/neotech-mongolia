@@ -656,6 +656,47 @@ def post_to_facebook(page_id: str, page_access_token: str, message: str) -> Dict
     return json.loads(body)
 
 
+def resolve_page_token_from_user_token(page_id: str, token: str) -> str:
+    """If token is a user token, resolve and return the matching page token."""
+    if not page_id or not token:
+        return token
+
+    url = "https://graph.facebook.com/v21.0/me/accounts"
+    query = urllib.parse.urlencode(
+        {
+            "fields": "id,name,tasks,access_token",
+            "access_token": token,
+        }
+    )
+    req = urllib.request.Request(f"{url}?{query}", method="GET")
+
+    try:
+        with urlopen_with_retry(req, 30, "Resolve page token via /me/accounts") as response:
+            body = response.read().decode("utf-8")
+        data = json.loads(body)
+    except Exception as exc:
+        print(f"[WARN] Could not resolve page token from user token: {exc}")
+        return token
+
+    if isinstance(data, dict) and "error" in data:
+        return token
+
+    for row in data.get("data", []):
+        if str(row.get("id", "")).strip() != page_id:
+            continue
+        page_token = str(row.get("access_token", "")).strip()
+        if not page_token:
+            continue
+        tasks = [str(x).strip() for x in row.get("tasks", []) if str(x).strip()]
+        if "CREATE_CONTENT" not in tasks:
+            print("[WARN] Page token resolved, but CREATE_CONTENT task is missing.")
+        else:
+            print("[INFO] Using page token resolved from user token.")
+        return page_token
+
+    return token
+
+
 def prune_state(posted: Dict[str, str], keep_days: int = 14) -> Dict[str, str]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
     cleaned: Dict[str, str] = {}
@@ -720,7 +761,8 @@ def main() -> int:
             return 1
 
         try:
-            result = post_to_facebook(page_id, page_access_token, message)
+            effective_token = resolve_page_token_from_user_token(page_id, page_access_token)
+            result = post_to_facebook(page_id, effective_token, message)
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
             print("[ERROR] Facebook API error")
