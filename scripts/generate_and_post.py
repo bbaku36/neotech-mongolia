@@ -266,7 +266,7 @@ def rewrite_json_array_with_gemini(
     if not api_key:
         return None
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
     query = urllib.parse.urlencode({"key": api_key})
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?{query}"
 
