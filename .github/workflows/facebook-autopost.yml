@@ -1,0 +1,56 @@
+name: Facebook Auto Post
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: facebook-autopost
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore posting state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/posted_items.json
+          key: fb-state-${{ github.run_id }}
+          restore-keys: |
+            fb-state-
+
+      - name: Ensure state directory
+        run: mkdir -p .state
+
+      - name: Run autopost
+        env:
+          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          HTTP_RETRIES: "4"
+          HTTP_RETRY_BACKOFF_SEC: "3"
+          DRY_RUN: "0"
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/generate_and_post.py
+
+      - name: Save posting state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/posted_items.json
+          key: fb-state-${{ github.run_id }}
