@@ -16,6 +16,7 @@ jobs:
   post:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: FACEBOOK_PAGE_ACCESS_TOKEN
 
     steps:
       - name: Checkout
