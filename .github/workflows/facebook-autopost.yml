@@ -48,7 +48,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .state/posted_items.json
-          key: fb-state-${{ github.run_id }}
+          key: fb-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             fb-state-
 
@@ -66,9 +66,18 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python scripts/generate_and_post.py
 
+      - name: Ensure state file exists
+        if: always()
+        run: |
+          mkdir -p .state
+          if [ ! -f .state/posted_items.json ]; then
+            echo "{}" > .state/posted_items.json
+          fi
+
       - name: Save posting state cache
         if: always()
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: .state/posted_items.json
-          key: fb-state-${{ github.run_id }}
+          key: fb-state-${{ github.run_id }}-${{ github.run_attempt }}
