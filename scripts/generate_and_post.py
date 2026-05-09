@@ -89,12 +89,63 @@ def load_env_file() -> None:
         os.environ.setdefault(key, value)
 
 
+MEDIA_NS = {"media": "http://search.yahoo.com/mrss/"}
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+
+
 def clean_html_text(value: str) -> str:
     if not value:
         return ""
     without_tags = re.sub(r"<[^>]+>", " ", value)
     unescaped = html.unescape(without_tags)
     return re.sub(r"\s+", " ", unescaped).strip()
+
+
+def looks_like_image_url(url: str) -> bool:
+    if not url:
+        return False
+    path = urllib.parse.urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+
+def extract_image_from_html(raw: str) -> str:
+    if not raw:
+        return ""
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', raw, re.IGNORECASE)
+    if not match:
+        return ""
+    return html.unescape(match.group(1).strip())
+
+
+def extract_rss_image(node, raw_description: str = "") -> str:
+    """Find a usable image URL inside an RSS 2.0 <item> or Atom <entry> node."""
+    for mc in node.findall("media:content", MEDIA_NS):
+        url = (mc.attrib.get("url") or "").strip()
+        medium = (mc.attrib.get("medium") or "").lower()
+        type_attr = (mc.attrib.get("type") or "").lower()
+        if url and (medium == "image" or type_attr.startswith("image/") or looks_like_image_url(url)):
+            return url
+
+    for mt in node.findall("media:thumbnail", MEDIA_NS):
+        url = (mt.attrib.get("url") or "").strip()
+        if url:
+            return url
+
+    for enc in node.findall("enclosure"):
+        url = (enc.attrib.get("url") or "").strip()
+        type_attr = (enc.attrib.get("type") or "").lower()
+        if url and (type_attr.startswith("image/") or looks_like_image_url(url)):
+            return url
+
+    # Atom enclosure variant: <link rel="enclosure" href="..." type="image/*"/>
+    atom_ns = {"atom": "http://www.w3.org/2005/Atom"}
+    for ln in node.findall("atom:link[@rel='enclosure']", atom_ns):
+        href = (ln.attrib.get("href") or "").strip()
+        type_attr = (ln.attrib.get("type") or "").lower()
+        if href and (type_attr.startswith("image/") or looks_like_image_url(href)):
+            return href
+
+    return extract_image_from_html(raw_description)
 
 
 def urlopen_with_retry(
@@ -266,7 +317,7 @@ def rewrite_json_array_with_gemini(
     if not api_key:
         return None
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip() or "gemini-3.1-flash-lite-preview"
     query = urllib.parse.urlencode({"key": api_key})
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?{query}"
 
@@ -360,6 +411,53 @@ def rewrite_headlines_with_ai(headlines: List[str], timeout_sec: int = 30) -> Li
     return None
 
 
+def summarize_article_with_ai(
+    title: str,
+    article_text: str,
+    source: str,
+    timeout_sec: int = 60,
+) -> tuple[str, str]:
+    """Send full article to AI and get (short, detailed) Mongolian summaries."""
+    if not article_text.strip():
+        return ("", "")
+
+    system_prompt = (
+        "You are a Mongolian tech news editor writing for a Facebook audience. Read the "
+        "provided English article and produce TWO Mongolian versions. "
+        "First — a SHORT 1-2 sentence hook capturing the single most important point in "
+        "engaging, clear Mongolian. "
+        "Second — a DETAILED 7-12 sentence breakdown covering: what happened in detail, "
+        "the companies, products, and people involved, relevant background and context, "
+        "important specifics (numbers, dates, quotes), why it matters and broader implications, "
+        "and any next steps or what to watch. "
+        "Both versions must be in natural, engaging Mongolian — not stiff word-for-word translation. "
+        "Stay strictly factual — use only what is in the article. Do not invent facts. "
+        "Do not include the headline, source name, hashtags, or links in either version. "
+        "Return ONLY a JSON array with EXACTLY two strings: [short_version, detailed_version]."
+    )
+
+    snippet = article_text.strip()
+    if len(snippet) > 9000:
+        snippet = snippet[:9000].rsplit(" ", 1)[0] + "..."
+
+    user_prompt = (
+        f"Title: {title}\n"
+        f"Source: {source}\n\n"
+        f"Article body:\n{snippet}"
+    )
+
+    parsed = rewrite_json_array_with_ai(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        expected_len=2,
+        timeout_sec=timeout_sec,
+        label="article short+detailed summary",
+    )
+    if parsed and len(parsed) == 2:
+        return (parsed[0].strip(), parsed[1].strip())
+    return ("", "")
+
+
 def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -> List[str] | None:
     if not items:
         return None
@@ -375,11 +473,13 @@ def rewrite_briefs_with_ai(items: List[Dict[str, str]], timeout_sec: int = 35) -
         )
 
     system_prompt = (
-        "You are a Mongolian tech news editor. For each input item, write a 2-3 sentence "
-        "Mongolian brief suitable for Facebook. The brief should include: "
-        "(1) what happened, (2) why it matters. Keep it factual. Use only provided "
-        "headline/description. Do not invent facts. Return only a JSON array of strings "
-        "in the same order and same length as input."
+        "You are a Mongolian tech news editor. For each input item, write a detailed "
+        "5-7 sentence Mongolian brief suitable for Facebook. The brief should cover: "
+        "(1) what happened in detail, (2) the key parties/companies/people involved, "
+        "(3) the relevant context or background, (4) why it matters and the broader impact, "
+        "(5) any notable next steps or implications. Write in natural, engaging Mongolian. "
+        "Keep it factual. Use only provided headline/description — do not invent facts. "
+        "Return only a JSON array of strings in the same order and same length as input."
     )
     user_prompt = "Items JSON:\n" + json.dumps(compact_items, ensure_ascii=False)
 
@@ -408,6 +508,76 @@ def resolve_final_url(url: str, timeout_sec: int = 12) -> str:
             return final_url or url
     except Exception:
         return url
+
+
+IMAGE_META_PATTERNS = [
+    r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
+    r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+]
+
+
+def _extract_meta_image(head: str) -> str:
+    for pat in IMAGE_META_PATTERNS:
+        match = re.search(pat, head, re.IGNORECASE)
+        if match:
+            candidate = html.unescape(match.group(1).strip())
+            if candidate.startswith("//"):
+                candidate = "https:" + candidate
+            if candidate.startswith("http"):
+                return candidate
+    return ""
+
+
+def _extract_article_body(html_body: str, max_chars: int = 10000) -> str:
+    cleaned = re.sub(r"<(script|style|noscript)[\s\S]*?</\1>", " ", html_body, flags=re.IGNORECASE)
+
+    scope = ""
+    art_match = re.search(r"<article[\s\S]*?</article>", cleaned, re.IGNORECASE)
+    if art_match:
+        scope = art_match.group(0)
+    if not scope:
+        main_match = re.search(r"<main[\s\S]*?</main>", cleaned, re.IGNORECASE)
+        if main_match:
+            scope = main_match.group(0)
+    if not scope:
+        scope = cleaned
+
+    paragraphs = re.findall(r"<p[^>]*>([\s\S]*?)</p>", scope, re.IGNORECASE)
+    parts: List[str] = []
+    for raw in paragraphs:
+        text = clean_html_text(raw)
+        if len(text) > 40:
+            parts.append(text)
+
+    body = "\n\n".join(parts)
+    if len(body) > max_chars:
+        body = body[:max_chars].rsplit(" ", 1)[0]
+    return body.strip()
+
+
+def fetch_article_meta(url: str, timeout_sec: int = 15) -> Dict[str, str]:
+    """Fetch article HTML and return {'image_url': ..., 'text': ...}."""
+    blank = {"image_url": "", "text": ""}
+    if not url:
+        return blank
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; FBMongoliaAutoPost/1.0)"},
+    )
+    try:
+        with urlopen_with_retry(req, timeout_sec, f"Fetch article HTML: {url}") as response:
+            body = response.read(2_000_000).decode("utf-8", errors="replace")
+    except Exception:
+        return blank
+
+    head = body.split("</head>", 1)[0]
+    return {
+        "image_url": _extract_meta_image(head),
+        "text": _extract_article_body(body),
+    }
 
 
 def clean_title_for_translation(title: str, source: str) -> str:
@@ -481,10 +651,14 @@ def fetch_rss_items(url: str, timeout_sec: int = 20) -> List[Dict[str, Any]]:
     for node in root.findall(".//item"):
         title = (node.findtext("title") or "").strip()
         link = (node.findtext("link") or "").strip()
-        description = clean_html_text((node.findtext("description") or "").strip())
+        raw_description = (node.findtext("description") or "").strip()
+        raw_encoded = (node.findtext("{http://purl.org/rss/1.0/modules/content/}encoded") or "").strip()
+        description = clean_html_text(raw_description)
         if not description:
-            description = clean_html_text((node.findtext("{http://purl.org/rss/1.0/modules/content/}encoded") or "").strip())
+            description = clean_html_text(raw_encoded)
         pub_date = parse_datetime_maybe(node.findtext("pubDate") or "")
+
+        image_url = extract_rss_image(node, raw_encoded or raw_description)
 
         source = ""
         source_node = node.find("source")
@@ -500,6 +674,7 @@ def fetch_rss_items(url: str, timeout_sec: int = 20) -> List[Dict[str, Any]]:
                     "description": description,
                     "source": source,
                     "pub_date": pub_date,
+                    "image_url": image_url,
                 }
             )
 
@@ -528,6 +703,7 @@ def fetch_rss_items(url: str, timeout_sec: int = 20) -> List[Dict[str, Any]]:
             or ""
         )
         source = normalize_source_name(feed_title, link)
+        image_url = extract_rss_image(entry, content_text or summary)
 
         if title and link:
             items.append(
@@ -537,6 +713,7 @@ def fetch_rss_items(url: str, timeout_sec: int = 20) -> List[Dict[str, Any]]:
                     "description": description,
                     "source": source,
                     "pub_date": pub_date,
+                    "image_url": image_url,
                 }
             )
 
@@ -645,80 +822,64 @@ def pick_items(items: List[Dict[str, Any]], posted: Dict[str, str], max_items: i
     return filtered
 
 
-def build_post(items: List[Dict[str, Any]]) -> str:
-    now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = [
-        f"Дэлхийн шинэ технологи ба AI мэдээ ({now_local})",
-        "",
-        "Сүүлийн тойм мэдээнүүд:",
-        "",
-    ]
+def build_item_post(item: Dict[str, Any]) -> str:
+    source = (item.get("source") or "").strip() or source_from_link(item.get("link", ""))
+    original_title = clean_title_for_translation(item.get("title", ""), source)
 
-    source_and_titles: List[tuple[str, str]] = []
-    for item in items:
-        source = item["source"].strip() if item.get("source") else "Google News"
-        source_and_titles.append((source, clean_title_for_translation(item["title"], source)))
+    translated_title = ""
+    rewrites = rewrite_headlines_with_ai([original_title])
+    if rewrites and rewrites[0].strip():
+        translated_title = rewrites[0].strip()
+    if not translated_title:
+        translated_title = translate_to_mongolian(original_title) or original_title
 
-    unique_titles: List[str] = []
-    for _, title in source_and_titles:
-        if title not in unique_titles:
-            unique_titles.append(title)
+    article_text = str(item.get("article_text") or "").strip()
+    rss_description = str(item.get("description") or "").strip()
 
-    ai_map: Dict[str, str] = {}
-    ai_rewrites = rewrite_headlines_with_ai(unique_titles)
-    if ai_rewrites:
-        ai_map = {title: ai_rewrites[i] for i, title in enumerate(unique_titles)}
+    short_brief = ""
+    detailed_brief = ""
 
-    translation_cache: Dict[str, str] = {}
-    brief_inputs: List[Dict[str, str]] = []
-    for idx, item in enumerate(items):
-        source, original_title = source_and_titles[idx]
-        brief_inputs.append(
-            {
-                "title": original_title,
-                "description": str(item.get("description", "")).strip(),
-                "source": source,
-            }
+    if article_text:
+        short_brief, detailed_brief = summarize_article_with_ai(original_title, article_text, source)
+
+    if not detailed_brief:
+        briefs = rewrite_briefs_with_ai(
+            [
+                {
+                    "title": original_title,
+                    "description": article_text or rss_description,
+                    "source": source,
+                }
+            ]
         )
+        if briefs and briefs[0].strip():
+            detailed_brief = briefs[0].strip()
 
-    ai_briefs = rewrite_briefs_with_ai(brief_inputs)
+    if not detailed_brief:
+        fallback_text = article_text[:1500] if article_text else rss_description
+        if fallback_text:
+            detailed_brief = translate_to_mongolian(fallback_text)
 
-    for i, item in enumerate(items, start=1):
-        source, original_title = source_and_titles[i - 1]
-        if original_title in ai_map:
-            translated_title = ai_map[original_title]
-        else:
-            if original_title not in translation_cache:
-                translation_cache[original_title] = translate_to_mongolian(original_title)
-            translated_title = translation_cache[original_title]
+    # If we have a detailed but no short, derive the short from the first sentence.
+    if detailed_brief and not short_brief:
+        match = re.match(r"\s*(.+?[\.!\?])(\s|$)", detailed_brief)
+        if match:
+            short_brief = match.group(1).strip()
 
-        brief = ""
-        if ai_briefs and len(ai_briefs) >= i and ai_briefs[i - 1].strip():
-            brief = ai_briefs[i - 1].strip()
-        else:
-            desc = str(item.get("description", "")).strip()
-            if desc:
-                brief = translate_to_mongolian(desc)
-            if not brief:
-                brief = "Дэлгэрэнгүй мэдээллийг доорх линкээс уншина уу."
-            if len(brief) > 420:
-                brief = brief[:417].rstrip() + "..."
-            if len(brief) < 120:
-                brief = (
-                    f"{brief} Энэ сэдэв нь технологи, AI-ийн чиг хандлагад нөлөөлөх боломжтой."
-                ).strip()
+    if len(detailed_brief) > 1800:
+        detailed_brief = detailed_brief[:1797].rstrip() + "..."
+    if len(short_brief) > 280:
+        short_brief = short_brief[:277].rstrip() + "..."
 
-        final_url = str(item.get("final_url") or item.get("link") or "").strip()
-        mn_reader_url = str(item.get("mn_reader_url") or "").strip() or build_mongolian_reader_link(final_url)
-
-        lines.append(f"{i}. {translated_title}")
-        lines.append(f"Дэлгэрэнгүй: {brief}")
-        lines.append(f"Эх сурвалж: {source}")
-        lines.append(f"Монгол хэлээр унших: {mn_reader_url}")
-        lines.append(f"Эх линк (англи): {final_url}")
+    lines: List[str] = [translated_title, ""]
+    if short_brief:
+        lines.append(short_brief)
         lines.append("")
-
-    lines.append("Та аль мэдээг нь илүү дэлгэрэнгүй задлуулмаар байгаагаа коммент дээр бичээрэй.")
+    if detailed_brief and detailed_brief != short_brief:
+        lines.append(detailed_brief)
+        lines.append("")
+    lines.append(f"Эх сурвалж: {source}")
+    lines.append("")
     lines.append("#ХиймэлОюун #Технологи #ШинэМэдээ #Дэлхий")
     return "\n".join(lines).strip()
 
@@ -734,6 +895,29 @@ def post_to_facebook(page_id: str, page_access_token: str, message: str) -> Dict
 
     req = urllib.request.Request(url, data=payload, method="POST")
     with urlopen_with_retry(req, 30, "Facebook post request") as response:
+        body = response.read().decode("utf-8")
+
+    return json.loads(body)
+
+
+def post_photo_to_facebook(
+    page_id: str,
+    page_access_token: str,
+    message: str,
+    image_url: str,
+) -> Dict[str, Any]:
+    url = f"https://graph.facebook.com/{page_id}/photos"
+    payload = urllib.parse.urlencode(
+        {
+            "url": image_url,
+            "message": message,
+            "published": "true",
+            "access_token": page_access_token,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, method="POST")
+    with urlopen_with_retry(req, 60, "Facebook photo post request") as response:
         body = response.read().decode("utf-8")
 
     return json.loads(body)
@@ -833,37 +1017,70 @@ def main() -> int:
         item["final_url"] = final_url
         item["mn_reader_url"] = build_mongolian_reader_link(final_url)
 
-    message = build_post(selected)
+        meta = fetch_article_meta(final_url)
+        item["article_text"] = meta.get("text", "")
+        if not (item.get("image_url") or "").strip():
+            item["image_url"] = meta.get("image_url", "")
 
-    if dry_run:
-        print("[DRY RUN] Generated message:\n")
-        print(message)
-    else:
-        if not page_id or not page_access_token:
-            print("[ERROR] Missing FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN")
-            return 1
+    if not dry_run and (not page_id or not page_access_token):
+        print("[ERROR] Missing FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN")
+        return 1
 
-        try:
-            effective_token = resolve_page_token_from_user_token(page_id, page_access_token)
-            result = post_to_facebook(page_id, effective_token, message)
-        except urllib.error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            print("[ERROR] Facebook API error")
-            print(details)
-            return 1
-        except Exception as exc:
-            print(f"[ERROR] Failed to post to Facebook: {exc}")
-            return 1
+    effective_token = page_access_token
+    if not dry_run:
+        effective_token = resolve_page_token_from_user_token(page_id, page_access_token)
 
-        post_id = result.get("id", "unknown")
-        print(f"[OK] Posted to Facebook. post_id={post_id}")
+    success_count = 0
+    failure_count = 0
 
-    now_iso = datetime.now(timezone.utc).isoformat()
     for item in selected:
-        posted[item_hash(item["link"])] = now_iso
+        message = build_item_post(item)
+        image_url = (item.get("image_url") or "").strip()
+
+        if dry_run:
+            print(f"[DRY RUN] image_url={image_url or '(none)'}")
+            print(message)
+            print("---")
+            success_count += 1
+            continue
+
+        result: Dict[str, Any] | None = None
+        used_photo = False
+        if image_url:
+            try:
+                result = post_photo_to_facebook(page_id, effective_token, message, image_url)
+                used_photo = True
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                print(f"[WARN] Photo post failed, falling back to text. image_url={image_url}")
+                print(details)
+            except Exception as exc:
+                print(f"[WARN] Photo post failed, falling back to text: {exc}")
+
+        if result is None:
+            try:
+                result = post_to_facebook(page_id, effective_token, message)
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                print("[ERROR] Facebook API error")
+                print(details)
+                failure_count += 1
+                continue
+            except Exception as exc:
+                print(f"[ERROR] Failed to post to Facebook: {exc}")
+                failure_count += 1
+                continue
+
+        post_id = result.get("id") or result.get("post_id") or "unknown"
+        kind = "photo" if used_photo else "text"
+        print(f"[OK] Posted ({kind}) post_id={post_id}")
+        success_count += 1
+        posted[item_hash(item["link"])] = datetime.now(timezone.utc).isoformat()
+        save_state(prune_state(posted))
 
     save_state(prune_state(posted))
-    return 0
+    print(f"[INFO] Posted {success_count} items, {failure_count} failed.")
+    return 0 if failure_count == 0 else 1
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@ name: Facebook Auto Post
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    # 06:00 болон 18:00 Монголын цагаар (UTC+8) = 22:00 ба 10:00 UTC
+    - cron: "0 22 * * *"
+    - cron: "0 10 * * *"
   workflow_dispatch:
 
 permissions:
@@ -62,8 +64,10 @@ jobs:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
           AI_PROVIDER: "gemini"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-2.5-flash"
+          GEMINI_MODEL: "gemini-3.1-flash-lite-preview"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MAX_ITEMS: "2"
+          MAX_ITEM_AGE_HOURS: "12"
           HTTP_RETRIES: "4"
           HTTP_RETRY_BACKOFF_SEC: "3"
           DRY_RUN: "0"
