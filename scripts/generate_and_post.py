@@ -7,6 +7,7 @@ import html
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -981,9 +982,173 @@ def prune_state(posted: Dict[str, str], keep_days: int = 14) -> Dict[str, str]:
     return cleaned
 
 
+FACTS_STATE_FILE = STATE_DIR / "posted_facts.json"
+
+FACT_TOPICS = [
+    "Хиймэл оюуны түүхэн дэх сонирхолтой баримт",
+    "Хиймэл оюун хэрхэн ажилдаг тухай энгийн тайлбар",
+    "Монгол хэл, бичиг ба хиймэл оюун",
+    "Хиймэл оюун өдөр тутмын амьдралд",
+    "Робот ба автоматжуулалт",
+    "Хиймэл оюун ба эрүүл мэнд",
+    "Хиймэл оюун ба боловсрол",
+    "Компьютер ба интернетийн түүхэн сонирхолтой баримт",
+    "Сансрын технологийн сонирхолтой баримт",
+    "Хиймэл оюун ба урлаг, хөгжим",
+    "Хиймэл оюун ба тоглоом, виртуал ертөнц",
+    "Мобайл ба дагалдах төхөөрөмжийн сонирхолтой баримт",
+    "Кибер аюулгүй байдлын сонирхолтой баримт",
+    "Автомашин ба өөрөө жолоодох технологи",
+    "Дата төв ба үүлэн технологийн сонирхолтой баримт",
+    "Хиймэл оюун ба санхүү, эдийн засаг",
+]
+
+FACT_STATE_LIMIT = 60
+
+
+def load_facts_state() -> List[str]:
+    if not FACTS_STATE_FILE.exists():
+        return []
+
+    try:
+        data = json.loads(FACTS_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(item) for item in data if str(item).strip()]
+    except Exception:
+        pass
+
+    return []
+
+
+def save_facts_state(items: List[str]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    trimmed = items[-FACT_STATE_LIMIT:]
+    FACTS_STATE_FILE.write_text(json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def resolve_post_mode() -> str:
+    explicit = os.getenv("POST_MODE", "").strip().lower()
+    if explicit in {"news", "fact", "facts"}:
+        return "fact" if explicit in {"fact", "facts"} else "news"
+
+    cron = os.getenv("GITHUB_EVENT_SCHEDULE", "").strip()
+    if cron == "0 10 * * *":
+        return "fact"
+
+    return "news"
+
+
+def pick_fact_topic(recent_facts: List[str]) -> str:
+    recent_blob = "\n".join(recent_facts[-40:])
+    available = [topic for topic in FACT_TOPICS if topic not in recent_blob]
+    if not available:
+        available = list(FACT_TOPICS)
+    random.shuffle(available)
+    return available[0]
+
+
+def build_fact_post_with_ai(recent_facts: List[str], timeout_sec: int = 45) -> tuple[str, str]:
+    """Return (post_text, topic). post_text is empty on failure."""
+    topic = pick_fact_topic(recent_facts)
+
+    recent_lines = "\n".join(f"- {item}" for item in recent_facts[-20:]) or "- (байхгүй)"
+    system_prompt = (
+        "Чи 'Neotech' нэртэй монгол технологи, хиймэл оюуны Facebook хуудсын контент бичигч. "
+        "Нэг үнэхээр сонирхолтой, гайхмаар технологи эсвэл хиймэл оюуны тухай баримтыг монгол хэлээр бич. "
+        "Дараах шаардлагыг чанд баримтал: "
+        "(1) Эхний өгүүлбэр нь анхаарал татах hook байх (асуулт эсвэл гайхмаар мэдэгдэл). "
+        "(2) Нийт 3-5 өгүүлбэр, энгийн ойлгомжтой, амьд, сонирхолтой хэлбэрээр. "
+        "(3) Зөвхөн итгэлтэй, нийтээр хүлээн зөвшөөрөгдсөн баримт бич; тоо, огноо, статистикийг орвонгоор нь зохиож БОЛОХГҮЙ. "
+        "(4) Ямар нэг тоо, огноо хэлэхдээ зөвхөн баттай мэддэг бол л бич. "
+        "(5) Төгсгөлд нь 3-4 хамааралтай hashtag (#) нэм. "
+        "(6) Дурдсан сэдэв дээр төвлөрч, өөр сэдэв рүү хазайхгүй бай. "
+        "Зөвхөн постын текстийг JSON массиваар (нэг string) буцаа."
+    )
+    user_prompt = (
+        f"Сэдэв: {topic}\n\n"
+        f"Сүүлд ашигласан баримтууд (энэ сэдвүүдийг давтахгүй):\n{recent_lines}"
+    )
+
+    parsed = rewrite_json_array_with_ai(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        expected_len=1,
+        timeout_sec=timeout_sec,
+        label="ai fact post",
+    )
+    if parsed and parsed[0].strip():
+        return parsed[0].strip(), topic
+    return "", topic
+
+
+def run_fact_mode() -> int:
+    dry_run = os.getenv("DRY_RUN", "0").lower() in {"1", "true", "yes"}
+    count = max(1, int(os.getenv("FACT_COUNT", "1")))
+
+    page_id = os.getenv("FACEBOOK_PAGE_ID", "").strip()
+    page_access_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+
+    if not dry_run and (not page_id or not page_access_token):
+        print("[ERROR] Missing FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN")
+        return 1
+
+    effective_token = page_access_token
+    if not dry_run:
+        effective_token = resolve_page_token_from_user_token(page_id, page_access_token)
+
+    recent_facts = load_facts_state()
+    success_count = 0
+    failure_count = 0
+
+    for _ in range(count):
+        post_text, topic = build_fact_post_with_ai(recent_facts)
+        if not post_text:
+            print("[ERROR] Fact generation failed")
+            failure_count += 1
+            continue
+
+        if dry_run:
+            print(f"[DRY RUN] topic={topic}")
+            print(post_text)
+            print("---")
+            success_count += 1
+            recent_facts.append(f"{topic}: {post_text[:60]}")
+            continue
+
+        try:
+            result = post_to_facebook(page_id, effective_token, post_text)
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            print("[ERROR] Facebook API error")
+            print(details)
+            failure_count += 1
+            continue
+        except Exception as exc:
+            print(f"[ERROR] Failed to post to Facebook: {exc}")
+            failure_count += 1
+            continue
+
+        post_id = result.get("id") or result.get("post_id") or "unknown"
+        print(f"[OK] Posted (fact) topic={topic} post_id={post_id}")
+        success_count += 1
+        recent_facts.append(f"{topic}: {post_text[:60]}")
+        save_facts_state(recent_facts)
+
+    save_facts_state(recent_facts)
+    print(f"[INFO] Posted {success_count} facts, {failure_count} failed.")
+    return 0 if failure_count == 0 else 1
+
+
 def main() -> int:
     load_env_file()
 
+    if resolve_post_mode() == "fact":
+        return run_fact_mode()
+
+    return run_news_mode()
+
+
+def run_news_mode() -> int:
     max_items = int(os.getenv("MAX_ITEMS", "5"))
     max_age_hours = int(os.getenv("MAX_ITEM_AGE_HOURS", "12"))
     dry_run = os.getenv("DRY_RUN", "0").lower() in {"1", "true", "yes"}

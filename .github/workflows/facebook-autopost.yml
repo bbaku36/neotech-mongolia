@@ -6,6 +6,11 @@ on:
     - cron: "0 22 * * *"
     - cron: "0 10 * * *"
   workflow_dispatch:
+    inputs:
+      post_mode:
+        description: "news | fact (empty = auto by schedule)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -50,7 +55,7 @@ jobs:
       - name: Restore posting state cache
         uses: actions/cache/restore@v4
         with:
-          path: .state/posted_items.json
+          path: .state
           key: fb-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             fb-state-
@@ -66,6 +71,9 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: "gemini-flash-lite-latest"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POST_MODE: "${{ inputs.post_mode }}"
+          GITHUB_EVENT_SCHEDULE: "${{ github.event.schedule }}"
+          FACT_COUNT: "1"
           MAX_ITEMS: "2"
           MAX_ITEM_AGE_HOURS: "12"
           HTTP_RETRIES: "4"
@@ -81,11 +89,14 @@ jobs:
           if [ ! -f .state/posted_items.json ]; then
             echo "{}" > .state/posted_items.json
           fi
+          if [ ! -f .state/posted_facts.json ]; then
+            echo "[]" > .state/posted_facts.json
+          fi
 
       - name: Save posting state cache
         if: always()
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: .state/posted_items.json
+          path: .state
           key: fb-state-${{ github.run_id }}-${{ github.run_attempt }}
