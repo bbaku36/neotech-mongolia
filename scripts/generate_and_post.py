@@ -36,6 +36,15 @@ FEEDS = [
     "https://feeds.arstechnica.com/arstechnica/technology-lab",
 ]
 
+# Feeds for interesting science/tech facts and discoveries.
+FACT_FEEDS = [
+    "https://www.sciencedaily.com/rss/top/science.xml",
+    "https://phys.org/rss-feed/",
+    "https://www.sciencealert.com/feed",
+    "https://www.futurity.org/feed/",
+    "https://arstechnica.com/feed/",
+]
+
 POSITIVE_KEYWORDS = [
     "ai",
     "artificial intelligence",
@@ -1047,8 +1056,28 @@ def pick_fact_topic(recent_facts: List[str]) -> str:
     return available[0]
 
 
-def build_fact_post_with_ai(recent_facts: List[str], timeout_sec: int = 45) -> tuple[str, str]:
-    """Return (post_text, topic). post_text is empty on failure."""
+FACT_TOPIC_EN_QUERY = {
+    "Хиймэл оюуны түүхэн дэх сонирхолтой баримт": "artificial intelligence computer",
+    "Хиймэл оюун хэрхэн ажилдаг тухай энгийн тайлбар": "neural network",
+    "Монгол хэл, бичиг ба хиймэл оюун": "Mongolian script",
+    "Хиймэл оюун өдөр тутмын амьдралд": "smartphone artificial intelligence",
+    "Робот ба автоматжуулалт": "industrial robot",
+    "Хиймэл оюун ба эрүүл мэнд": "medical technology",
+    "Хиймэл оюун ба боловсрол": "online learning technology",
+    "Компьютер ба интернетийн түүхэн сонирхолтой баримт": "vintage computer",
+    "Сансрын технологийн сонирхолтой баримт": "space rocket launch",
+    "Хиймэл оюун ба урлаг, хөгжим": "digital art music",
+    "Хиймэл оюун ба тоглоом, виртуал ертөнц": "virtual reality headset",
+    "Мобайл ба дагалдах төхөөрөмжийн сонирхолтой баримт": "smartphone gadgets",
+    "Кибер аюулгүй байдлын сонирхолтой баримт": "cybersecurity computer",
+    "Автомашин ба өөрөө жолоодох технологи": "autonomous car",
+    "Дата төв ба үүлэн технологийн сонирхолтой баримт": "data center servers",
+    "Хиймэл оюун ба санхүү, эдийн засаг": "financial technology",
+}
+
+
+def build_fact_post_with_ai(recent_facts: List[str], timeout_sec: int = 45) -> tuple[str, str, str]:
+    """Return (post_text, image_query, topic). post_text is empty on failure."""
     topic = pick_fact_topic(recent_facts)
 
     recent_lines = "\n".join(f"- {item}" for item in recent_facts[-20:]) or "- (байхгүй)"
@@ -1062,7 +1091,9 @@ def build_fact_post_with_ai(recent_facts: List[str], timeout_sec: int = 45) -> t
         "(4) Ямар нэг тоо, огноо хэлэхдээ зөвхөн баттай мэддэг бол л бич. "
         "(5) Төгсгөлд нь 3-4 хамааралтай hashtag (#) нэм. "
         "(6) Дурдсан сэдэв дээр төвлөрч, өөр сэдэв рүү хазайхгүй бай. "
-        "Зөвхөн постын текстийг JSON массиваар (нэг string) буцаа."
+        "Мөн постод тохирох, зураг хайхад ашиглах 2-4 үгтэй АНГЛИ хэл дээрх энгийн хайлтын түлхүүр үгийг бод. "
+        "Зөвхөн JSON массиваар ЯГ хоёр string буцаа: [постын текст, англи зураг хайх түлхүүр үг]. "
+        "Хайлтын түлхүүр үгэнд hashtag, цэг таслал, хашилт бүү хий."
     )
     user_prompt = (
         f"Сэдэв: {topic}\n\n"
@@ -1072,18 +1103,224 @@ def build_fact_post_with_ai(recent_facts: List[str], timeout_sec: int = 45) -> t
     parsed = rewrite_json_array_with_ai(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        expected_len=1,
+        expected_len=2,
         timeout_sec=timeout_sec,
         label="ai fact post",
     )
-    if parsed and parsed[0].strip():
-        return parsed[0].strip(), topic
-    return "", topic
+    if parsed and len(parsed) >= 1 and parsed[0].strip():
+        image_query = parsed[1].strip() if len(parsed) >= 2 else ""
+        if not image_query:
+            image_query = FACT_TOPIC_EN_QUERY.get(topic, "technology")
+        return parsed[0].strip(), image_query, topic
+    return "", FACT_TOPIC_EN_QUERY.get(topic, "technology"), topic
+
+
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+IMAGE_EXCLUDE_WORDS = (
+    "diagram",
+    "logo",
+    "icon",
+    "chart",
+    "map",
+    "poster",
+    "graph",
+    "table",
+    "screenshot",
+    "drawing",
+    "clipart",
+    "symbol",
+    "banner",
+    "seal",
+    "coat of arms",
+    "signature",
+    "svg",
+    "plot",
+)
+
+
+def fetch_related_image_url(query: str, timeout_sec: int = 20) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9 ]+", " ", query or "").strip() or "technology"
+    search = f"{cleaned} -diagram -logo -icon -chart -poster -map -graph -table -screenshot -drawing -symbol"
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": search,
+        "gsrnamespace": "6",
+        "gsrlimit": "10",
+        "prop": "imageinfo",
+        "iiprop": "url|size",
+        "iiurlwidth": "1200",
+    }
+    url = f"{COMMONS_API}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "FBMongoliaAutoPost/1.0 (tech facts image search)"},
+    )
+    try:
+        with urlopen_with_retry(req, timeout_sec, "commons image search") as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[WARN] Image search failed: {exc}")
+        return ""
+
+    pages = (data.get("query") or {}).get("pages") or {}
+    candidates = sorted(pages.values(), key=lambda page: page.get("index", 99))
+    for page in candidates:
+        title = str(page.get("title", "")).lower()
+        if any(bad in title for bad in IMAGE_EXCLUDE_WORDS):
+            continue
+        if re.search(r"\.(svg|pdf|gif|tif|tiff|ogv|webm|mid|ogg)$", title):
+            continue
+        info = (page.get("imageinfo") or [{}])[0]
+        candidate = (info.get("thumburl") or info.get("url") or "").strip()
+        if not candidate:
+            continue
+        width = info.get("thumbwidth") or info.get("width") or 0
+        if width and width < 640:
+            continue
+        return candidate.split("?")[0]
+    return ""
+
+
+def prepare_items_for_posting(selected: List[Dict[str, Any]]) -> None:
+    for item in selected:
+        final_url = resolve_final_url(item["link"])
+        item["final_url"] = final_url
+        item["mn_reader_url"] = build_mongolian_reader_link(final_url)
+
+        meta = fetch_article_meta(final_url)
+        item["article_text"] = meta.get("text", "")
+        if not (item.get("image_url") or "").strip():
+            item["image_url"] = meta.get("image_url", "")
+
+
+def post_items_to_facebook(
+    selected: List[Dict[str, Any]],
+    page_id: str,
+    effective_token: str,
+    dry_run: bool,
+    posted: Dict[str, str],
+    label: str = "item",
+) -> tuple[int, int]:
+    success_count = 0
+    failure_count = 0
+
+    for item in selected:
+        message = build_item_post(item)
+        image_url = (item.get("image_url") or "").strip()
+
+        if dry_run:
+            print(f"[DRY RUN] ({label}) image_url={image_url or '(none)'}")
+            print(message)
+            print("---")
+            success_count += 1
+            continue
+
+        result: Dict[str, Any] | None = None
+        used_photo = False
+        if image_url:
+            try:
+                result = post_photo_to_facebook(page_id, effective_token, message, image_url)
+                used_photo = True
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                print(f"[WARN] Photo post failed, falling back to text. image_url={image_url}")
+                print(details)
+            except Exception as exc:
+                print(f"[WARN] Photo post failed, falling back to text: {exc}")
+
+        if result is None:
+            try:
+                result = post_to_facebook(page_id, effective_token, message)
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                print("[ERROR] Facebook API error")
+                print(details)
+                failure_count += 1
+                continue
+            except Exception as exc:
+                print(f"[ERROR] Failed to post to Facebook: {exc}")
+                failure_count += 1
+                continue
+
+        post_id = result.get("id") or result.get("post_id") or "unknown"
+        kind = "photo" if used_photo else "text"
+        print(f"[OK] Posted ({kind}, {label}) post_id={post_id}")
+        success_count += 1
+        posted[item_hash(item["link"])] = datetime.now(timezone.utc).isoformat()
+        save_state(prune_state(posted))
+
+    return success_count, failure_count
+
+
+def run_ai_fact_mode(dry_run: bool, count: int, page_id: str, effective_token: str) -> int:
+    recent_facts = load_facts_state()
+    success_count = 0
+    failure_count = 0
+    fact_image_enabled = os.getenv("FACT_IMAGE", "1").lower() in {"1", "true", "yes"}
+
+    for _ in range(count):
+        post_text, image_query, topic = build_fact_post_with_ai(recent_facts)
+        if not post_text:
+            print("[ERROR] Fact generation failed")
+            failure_count += 1
+            continue
+
+        image_url = fetch_related_image_url(image_query) if fact_image_enabled else ""
+
+        if dry_run:
+            print(f"[DRY RUN] topic={topic} image_query={image_query}")
+            print(f"[DRY RUN] image_url={image_url or '(none)'}")
+            print(post_text)
+            print("---")
+            success_count += 1
+            recent_facts.append(f"{topic}: {post_text[:60]}")
+            continue
+
+        result: Dict[str, Any] | None = None
+        used_photo = False
+        if image_url:
+            try:
+                result = post_photo_to_facebook(page_id, effective_token, post_text, image_url)
+                used_photo = True
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                print(f"[WARN] Fact photo post failed, falling back to text. image_url={image_url}")
+                print(details)
+            except Exception as exc:
+                print(f"[WARN] Fact photo post failed, falling back to text: {exc}")
+
+        if result is None:
+            try:
+                result = post_to_facebook(page_id, effective_token, post_text)
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                print("[ERROR] Facebook API error")
+                print(details)
+                failure_count += 1
+                continue
+            except Exception as exc:
+                print(f"[ERROR] Failed to post to Facebook: {exc}")
+                failure_count += 1
+                continue
+
+        post_id = result.get("id") or result.get("post_id") or "unknown"
+        kind = "fact+photo" if used_photo else "fact"
+        print(f"[OK] Posted ({kind}) topic={topic} post_id={post_id}")
+        success_count += 1
+        recent_facts.append(f"{topic}: {post_text[:60]}")
+        save_facts_state(recent_facts)
+
+    save_facts_state(recent_facts)
+    print(f"[INFO] Posted {success_count} AI facts, {failure_count} failed.")
+    return 0 if failure_count == 0 else 1
 
 
 def run_fact_mode() -> int:
     dry_run = os.getenv("DRY_RUN", "0").lower() in {"1", "true", "yes"}
     count = max(1, int(os.getenv("FACT_COUNT", "1")))
+    max_age_hours = int(os.getenv("FACT_MAX_AGE_HOURS", "72"))
 
     page_id = os.getenv("FACEBOOK_PAGE_ID", "").strip()
     page_access_token = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
@@ -1096,47 +1333,31 @@ def run_fact_mode() -> int:
     if not dry_run:
         effective_token = resolve_page_token_from_user_token(page_id, page_access_token)
 
-    recent_facts = load_facts_state()
-    success_count = 0
-    failure_count = 0
-
-    for _ in range(count):
-        post_text, topic = build_fact_post_with_ai(recent_facts)
-        if not post_text:
-            print("[ERROR] Fact generation failed")
-            failure_count += 1
-            continue
-
-        if dry_run:
-            print(f"[DRY RUN] topic={topic}")
-            print(post_text)
-            print("---")
-            success_count += 1
-            recent_facts.append(f"{topic}: {post_text[:60]}")
-            continue
-
+    all_items: List[Dict[str, Any]] = []
+    for feed_url in FACT_FEEDS:
         try:
-            result = post_to_facebook(page_id, effective_token, post_text)
-        except urllib.error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            print("[ERROR] Facebook API error")
-            print(details)
-            failure_count += 1
-            continue
+            all_items.extend(fetch_rss_items(feed_url))
         except Exception as exc:
-            print(f"[ERROR] Failed to post to Facebook: {exc}")
-            failure_count += 1
-            continue
+            print(f"[WARN] Failed to read feed: {feed_url}")
+            print(f"       {exc}")
 
-        post_id = result.get("id") or result.get("post_id") or "unknown"
-        print(f"[OK] Posted (fact) topic={topic} post_id={post_id}")
-        success_count += 1
-        recent_facts.append(f"{topic}: {post_text[:60]}")
-        save_facts_state(recent_facts)
+    selected: List[Dict[str, Any]] = []
+    posted = prune_state(load_state())
+    if all_items:
+        all_items = dedupe_and_sort(all_items)
+        selected = pick_items(all_items, posted, max_items=count, max_age_hours=max_age_hours)
 
-    save_facts_state(recent_facts)
-    print(f"[INFO] Posted {success_count} facts, {failure_count} failed.")
-    return 0 if failure_count == 0 else 1
+    if selected:
+        prepare_items_for_posting(selected)
+        success, failure = post_items_to_facebook(
+            selected, page_id, effective_token, dry_run, posted, label="fact"
+        )
+        save_state(prune_state(posted))
+        print(f"[INFO] Posted {success} sourced facts, {failure} failed.")
+        return 0 if failure == 0 else 1
+
+    print("[INFO] No suitable source items; falling back to AI-generated facts.")
+    return run_ai_fact_mode(dry_run, count, page_id, effective_token)
 
 
 def main() -> int:
