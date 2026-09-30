@@ -1183,6 +1183,113 @@ def fetch_related_image_url(query: str, timeout_sec: int = 20) -> str:
     return ""
 
 
+IMAGE_MIN_WIDTH = 700
+IMAGE_MIN_HEIGHT = 300
+
+
+def upgrade_image_url(url: str) -> str:
+    """Turn known small-thumbnail URLs into higher-resolution variants."""
+    value = (url or "").strip()
+    if not value:
+        return ""
+
+    # phys.org and sibling sites serve tiny /news/tmb/ (90x90) thumbnails.
+    value = re.sub(r"/news/tmb/", "/news/800/", value)
+    return value
+
+
+def image_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 24:
+        return (0, 0)
+
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big"))
+
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return (int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little"))
+
+    if data[:2] == b"\xff\xd8":
+        index = 2
+        length = len(data)
+        while index + 9 < length:
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                index += 2
+                continue
+            segment_length = int.from_bytes(data[index + 2:index + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height = int.from_bytes(data[index + 5:index + 7], "big")
+                width = int.from_bytes(data[index + 7:index + 9], "big")
+                return (width, height)
+            index += 2 + segment_length
+        return (0, 0)
+
+    return (0, 0)
+
+
+def image_is_acceptable(url: str, timeout_sec: int = 15) -> bool:
+    if not url:
+        return False
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; FBMongoliaAutoPost/1.0)",
+            "Accept": "image/*",
+        },
+    )
+    try:
+        with urlopen_with_retry(req, timeout_sec, "Probe image") as response:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            content_length = int(response.headers.get("Content-Length") or 0)
+            data = response.read(400_000)
+    except Exception:
+        return False
+
+    if "text/html" in content_type:
+        return False
+
+    width, height = image_dimensions(data)
+    if width and height:
+        return width >= IMAGE_MIN_WIDTH and height >= IMAGE_MIN_HEIGHT
+
+    # Fallback when dimensions cannot be parsed: reject suspiciously small files.
+    if content_length:
+        return content_length >= 15_000
+    return len(data) >= 15_000
+
+
+def pick_best_image(
+    rss_image: str,
+    meta_image: str,
+    query: str = "",
+    timeout_sec: int = 15,
+) -> str:
+    candidates: List[str] = []
+    for raw in (meta_image, rss_image):
+        upgraded = upgrade_image_url(raw)
+        if upgraded:
+            candidates.append(upgraded)
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if image_is_acceptable(candidate, timeout_sec):
+            return candidate
+
+    fallback_query = re.sub(r"[^a-zA-Z0-9 ]+", " ", query or "").strip()
+    if fallback_query:
+        fallback = fetch_related_image_url(fallback_query)
+        if fallback and image_is_acceptable(fallback, timeout_sec):
+            return fallback
+
+    return ""
+
+
 def prepare_items_for_posting(selected: List[Dict[str, Any]]) -> None:
     for item in selected:
         final_url = resolve_final_url(item["link"])
@@ -1191,8 +1298,11 @@ def prepare_items_for_posting(selected: List[Dict[str, Any]]) -> None:
 
         meta = fetch_article_meta(final_url)
         item["article_text"] = meta.get("text", "")
-        if not (item.get("image_url") or "").strip():
-            item["image_url"] = meta.get("image_url", "")
+        item["image_url"] = pick_best_image(
+            rss_image=item.get("image_url", ""),
+            meta_image=meta.get("image_url", ""),
+            query=item.get("title", ""),
+        )
 
 
 def post_items_to_facebook(
@@ -1398,15 +1508,7 @@ def run_news_mode() -> int:
         save_state(posted)
         return 0
 
-    for item in selected:
-        final_url = resolve_final_url(item["link"])
-        item["final_url"] = final_url
-        item["mn_reader_url"] = build_mongolian_reader_link(final_url)
-
-        meta = fetch_article_meta(final_url)
-        item["article_text"] = meta.get("text", "")
-        if not (item.get("image_url") or "").strip():
-            item["image_url"] = meta.get("image_url", "")
+    prepare_items_for_posting(selected)
 
     if not dry_run and (not page_id or not page_access_token):
         print("[ERROR] Missing FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN")
@@ -1416,54 +1518,9 @@ def run_news_mode() -> int:
     if not dry_run:
         effective_token = resolve_page_token_from_user_token(page_id, page_access_token)
 
-    success_count = 0
-    failure_count = 0
-
-    for item in selected:
-        message = build_item_post(item)
-        image_url = (item.get("image_url") or "").strip()
-
-        if dry_run:
-            print(f"[DRY RUN] image_url={image_url or '(none)'}")
-            print(message)
-            print("---")
-            success_count += 1
-            continue
-
-        result: Dict[str, Any] | None = None
-        used_photo = False
-        if image_url:
-            try:
-                result = post_photo_to_facebook(page_id, effective_token, message, image_url)
-                used_photo = True
-            except urllib.error.HTTPError as exc:
-                details = exc.read().decode("utf-8", errors="replace")
-                print(f"[WARN] Photo post failed, falling back to text. image_url={image_url}")
-                print(details)
-            except Exception as exc:
-                print(f"[WARN] Photo post failed, falling back to text: {exc}")
-
-        if result is None:
-            try:
-                result = post_to_facebook(page_id, effective_token, message)
-            except urllib.error.HTTPError as exc:
-                details = exc.read().decode("utf-8", errors="replace")
-                print("[ERROR] Facebook API error")
-                print(details)
-                failure_count += 1
-                continue
-            except Exception as exc:
-                print(f"[ERROR] Failed to post to Facebook: {exc}")
-                failure_count += 1
-                continue
-
-        post_id = result.get("id") or result.get("post_id") or "unknown"
-        kind = "photo" if used_photo else "text"
-        print(f"[OK] Posted ({kind}) post_id={post_id}")
-        success_count += 1
-        posted[item_hash(item["link"])] = datetime.now(timezone.utc).isoformat()
-        save_state(prune_state(posted))
-
+    success_count, failure_count = post_items_to_facebook(
+        selected, page_id, effective_token, dry_run, posted, label="news"
+    )
     save_state(prune_state(posted))
     print(f"[INFO] Posted {success_count} items, {failure_count} failed.")
     return 0 if failure_count == 0 else 1
