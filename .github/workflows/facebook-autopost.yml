@@ -64,7 +64,7 @@ jobs:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
           AI_PROVIDER: "gemini"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-3.1-flash-lite-preview"
+          GEMINI_MODEL: "gemini-flash-lite-latest"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MAX_ITEMS: "2"
           MAX_ITEM_AGE_HOURS: "12"
